@@ -40,7 +40,7 @@ plugins {
   id "com.github.spotbugs" version '4.7.1' apply false
   id 'org.gradle.test-retry' version '1.2.1' apply false
   id 'org.scoverage' version '5.0.0' apply false
-  id 'com.github.johnrengelman.shadow' version '7.0.0' apply false
+  id 'com.github.johnrengelman.shadow' version '6.1.0' apply false
 }
 
 spotless {
