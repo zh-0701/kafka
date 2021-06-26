@@ -56,18 +56,13 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 
-/**
- * This class acts as a queue that accumulates records into {@link MemoryRecords}
- * instances to be sent to the server.
- * <p>
- * The accumulator uses a bounded amount of memory and append calls will block when that memory is exhausted, unless
- * this behavior is explicitly disabled.
- */
+//客户端消息收集器
 public final class RecordAccumulator {
 
     private final Logger log;
     private volatile boolean closed;
     private final AtomicInteger flushesInProgress;
+    //每次开始append ，值+1，结束后-1，该值大于0表示正在append
     private final AtomicInteger appendsInProgress;
     private final int batchSize;
     private final CompressionType compression;
@@ -77,6 +72,7 @@ public final class RecordAccumulator {
     private final BufferPool free;
     private final Time time;
     private final ApiVersions apiVersions;
+    //存放所有的双端队列
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;
     private final IncompleteBatches incomplete;
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
@@ -177,6 +173,7 @@ public final class RecordAccumulator {
      *                        running the partitioner's onNewBatch method before trying to append again
      * @param nowMs The current time, in milliseconds
      */
+    //将消息加入收集器入口
     public RecordAppendResult append(TopicPartition tp,
                                      long timestamp,
                                      byte[] key,
@@ -192,17 +189,19 @@ public final class RecordAccumulator {
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
-            // check if we have an in-progress batch
+            // 根据topic和partition获取双端队列，队列中每个节点都是一批msg，该队列存放该生产者下的该partition的所有数据
             Deque<ProducerBatch> dq = getOrCreateDeque(tp);
             synchronized (dq) {
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
+                //尝试将新的消息追加到双端队列中的最后一个批次里面
+                //若追加失败appendResult 返回null
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
                 if (appendResult != null)
                     return appendResult;
             }
 
-            // we don't have an in-progress record batch try to allocate a new batch
+            // 是否允许创建一个新的批次
             if (abortOnNewBatch) {
                 // Return a result that will cause another call to append.
                 return new RecordAppendResult(null, false, false, true);
@@ -211,6 +210,7 @@ public final class RecordAccumulator {
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {} with remaining timeout {}ms", size, tp.topic(), tp.partition(), maxTimeToBlock);
+            //新批次的buffer
             buffer = free.allocate(size, maxTimeToBlock);
 
             // Update the current time in case the buffer allocation blocked above.
@@ -219,18 +219,20 @@ public final class RecordAccumulator {
                 // Need to check if producer is closed again after grabbing the dequeue lock.
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
-
+                //双重校验锁模式，判断在创建批次期间是否有其他线程创建了新的批次
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
                     return appendResult;
                 }
 
+                //创建新的批次对象
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, nowMs);
                 FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
                         callback, nowMs));
 
+                //将新的批次放入双端队列
                 dq.addLast(batch);
                 incomplete.add(batch);
 
@@ -266,9 +268,11 @@ public final class RecordAccumulator {
         ProducerBatch last = deque.peekLast();
         if (last != null) {
             FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, nowMs);
-            if (future == null)
+            if (future == null)//为空表示最后一个批次放不下该消息了
+                //关闭最后一个批次的流
                 last.closeForRecordAppends();
             else
+                //放入成功则返回result
                 return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false, false);
         }
         return null;
@@ -306,6 +310,7 @@ public final class RecordAccumulator {
                     ProducerBatch batch = deque.getFirst();
                     if (batch.hasReachedDeliveryTimeout(deliveryTimeoutMs, now)) {
                         deque.poll();
+                        //关闭流
                         batch.abortRecordAppends();
                         expiredBatches.add(batch);
                     } else {
@@ -441,6 +446,7 @@ public final class RecordAccumulator {
      * </ol>
      */
     public ReadyCheckResult ready(Cluster cluster, long nowMs) {
+        //可能多个partition的主副本节点在同一个broker，所以需要筛选出不重复的broker 放到set里面
         Set<Node> readyNodes = new HashSet<>();
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
         Set<String> unknownLeaderTopics = new HashSet<>();
@@ -454,6 +460,7 @@ public final class RecordAccumulator {
                 ProducerBatch batch = deque.peekFirst();
                 if (batch != null) {
                     TopicPartition part = entry.getKey();
+                    //找到主副本节点
                     Node leader = cluster.leaderFor(part);
                     if (leader == null) {
                         // This is a partition for which leader is not known, but messages are available to send.
@@ -536,6 +543,7 @@ public final class RecordAccumulator {
 
     private List<ProducerBatch> drainBatchesForOneNode(Cluster cluster, Node node, int maxSize, long now) {
         int size = 0;
+        //获取节点下所有分区
         List<PartitionInfo> parts = cluster.partitionsForNode(node.id());
         List<ProducerBatch> ready = new ArrayList<>();
         /* to make starvation less likely this loop doesn't start at 0 */
@@ -827,6 +835,7 @@ public final class RecordAccumulator {
      * The set of nodes that have at least one complete record batch in the accumulator
      */
     public final static class ReadyCheckResult {
+        //所有需要被发送消息的broker节点
         public final Set<Node> readyNodes;
         public final long nextReadyCheckDelayMs;
         public final Set<String> unknownLeaderTopics;

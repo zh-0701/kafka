@@ -82,7 +82,7 @@ public class Sender implements Runnable {
     /* the metadata for the client */
     private final ProducerMetadata metadata;
 
-    /* the flag indicating whether the producer should guarantee the message order on the broker or not. */
+    //是否保证顺序
     private final boolean guaranteeMessageOrder;
 
     /* the maximum request size to attempt to send to the server */
@@ -118,7 +118,7 @@ public class Sender implements Runnable {
     /* all the state related to transactions, in particular the producer id, producer epoch, and sequence numbers */
     private final TransactionManager transactionManager;
 
-    // A per-partition queue of batches ordered by creation time for tracking the in-flight batches
+    // 每次发送之前会将批次放入这个map
     private final Map<TopicPartition, List<ProducerBatch>> inFlightBatches;
 
     public Sender(LogContext logContext,
@@ -175,6 +175,7 @@ public class Sender implements Runnable {
     /**
      *  Get the in-flight batches that has reached delivery timeout.
      */
+    //挑出已过期的批次
     private List<ProducerBatch> getExpiredInflightBatches(long now) {
         List<ProducerBatch> expiredBatches = new ArrayList<>();
 
@@ -296,6 +297,7 @@ public class Sender implements Runnable {
      *
      */
     void runOnce() {
+        //事务消息
         if (transactionManager != null) {
             try {
                 transactionManager.maybeResolveSequences();
@@ -330,7 +332,7 @@ public class Sender implements Runnable {
 
     private long sendProducerData(long now) {
         Cluster cluster = metadata.fetch();
-        // get the list of partitions with data ready to send
+        // 获取准备发送的所有分区
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
         // if there are any partitions whose leaders are not known yet, force metadata update
@@ -351,16 +353,19 @@ public class Sender implements Runnable {
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
             Node node = iter.next();
+            //校验连接通道已就绪，若没就绪返回false并且去初始化通道
             if (!this.client.ready(node, now)) {
                 iter.remove();
                 notReadyTimeout = Math.min(notReadyTimeout, this.client.pollDelayMs(node, now));
             }
         }
 
-        // create produce requests
+        // 获取每个节点将要发送的批次数据
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
+        //发送前存储将要发送的 内容
         addToInflightBatches(batches);
         if (guaranteeMessageOrder) {
+            //给所有一个节点下的所有批次数据同一排序
             // Mute all the partitions drained
             for (List<ProducerBatch> batchList : batches.values()) {
                 for (ProducerBatch batch : batchList)
@@ -369,8 +374,11 @@ public class Sender implements Runnable {
         }
 
         accumulator.resetNextBatchExpiryTime();
+        //挑出发送中的已过期批次
         List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
+        //挑出双端队列中所有已过期批次
         List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
+        //所有过期的批次
         expiredBatches.addAll(expiredInflightBatches);
 
         // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
@@ -378,6 +386,7 @@ public class Sender implements Runnable {
         // we need to reset the producer id here.
         if (!expiredBatches.isEmpty())
             log.trace("Expired {} batches in accumulator", expiredBatches.size());
+        //循环打印全部已过期批次
         for (ProducerBatch expiredBatch : expiredBatches) {
             String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
                 + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";

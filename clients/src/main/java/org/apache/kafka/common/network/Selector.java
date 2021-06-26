@@ -108,6 +108,7 @@ public class Selector implements Selectable, AutoCloseable {
     private boolean outOfMemory;
     private final List<NetworkSend> completedSends;
     private final LinkedHashMap<String, NetworkReceive> completedReceives;
+    //存放所有通道的key
     private final Set<SelectionKey> immediatelyConnectedKeys;
     private final Map<String, KafkaChannel> closingChannels;
     private Set<SelectionKey> keysWithBufferedRead;
